@@ -1,6 +1,7 @@
 # MusicBrainz.py
 # Example addon implementataion using MusicBrainz API
 
+import os
 import requests
 import time
 from typing import List, Dict, Any, Optional
@@ -39,6 +40,11 @@ class MusicBrainz(MetadataFetcher):
 
     # Recommended to have meaningful user-agent
     USER_AGENT = "metadata-docker-musicbrainz-addon/1.0.0"
+
+    required_env_vars = ["MD_MUSICBRAINZ_FETCH_COVER"]
+
+    # Get setting from environment
+    FETCH_COVERART = os.getenv("MD_MUSICBRAINZ_FETCH_COVER", "False").lower() in ('true', '1', 'yes', 'on')
 
     _last_request_time = 0.0
 
@@ -112,6 +118,26 @@ class MusicBrainz(MetadataFetcher):
         formatted_genres = [name.title() for name in names]
         return "; ".join(formatted_genres)
 
+    def _get_cover_art_url(self, release_id: str) -> Optional[str]:
+        """
+        Query the Cover Art Archive for the front cover image URL.
+        Returns the URL as a string, or None if not found.
+        """
+        self._rate_limit()
+        url = f"https://coverartarchive.org/release/{release_id}"
+        try:
+            resp = self.session.get(url)
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            data = resp.json()
+            for img in data.get("images", []):
+                if img.get("front"):
+                    return img.get("image")
+        except Exception:
+            pass
+        return None
+
     def _build_track_metadata(
         self,
         recording: Dict,
@@ -182,9 +208,6 @@ class MusicBrainz(MetadataFetcher):
         genres_data = recording.get("genres", [])
         track["genre"] = self._format_genres(genres_data)
 
-        # coveart - base64 encoded(optional)
-        # track["picture"] = ""
-
         # Add any other primitive fields from recording (optional)
         for key, value in recording.items():
             if key not in track and not isinstance(value, (dict, list)):
@@ -194,38 +217,51 @@ class MusicBrainz(MetadataFetcher):
 
     # ------------------ Search Methods ------------------
 
-    def search_songs(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+    def search_songs(self, query: str, limit: int = 5, include_coverart: Optional[bool] = None) -> List[Dict[str, Any]]:
         """
         Search for recordings (songs). Results include:
           - musicbrainz_trackid, title, artist
         """
-        params = {"query": query, "limit": min(limit, 100)}
+        if include_coverart is None:
+            include_coverart = self.FETCH_COVERART
+        params = {"query": query, "limit": min(limit, 100), "inc": "releases"}
         data = self._get("recording", params)
         results = []
         for rec in data.get("recordings", []):
-            results.append({
+            release_id = None
+            if rec.get("releases"):
+                # Pick the first release
+                release_id = rec["releases"][0].get("id")
+
+            entry = {
                 "id": rec.get("id"),
                 "title": rec.get("title", "Unknown"),
                 "artist": self._flatten_artist(rec.get("artist-credit", [])),
-                # base64 encoded coveart(optional)
-                # "coverart": "" 
-            })
+                "coverart": None
+            }
+            if include_coverart and release_id:
+                entry["coverart"] = self._get_cover_art_url(release_id)
+            results.append(entry)
         return results[:limit]
 
-    def search_albums(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+    def search_albums(self, query: str, limit: int = 5, include_coverart: Optional[bool] = None) -> List[Dict[str, Any]]:
         """
         Search for releases (albums). Results include:
           - musicbrainz_albumid, title, artist, year (from release date)
         """
+        if include_coverart is None:
+            include_coverart = self.FETCH_COVERART
         params = {"query": query, "limit": min(limit, 100)}
         data = self._get("release", params)
         results = []
         for rel in data.get("releases", []):
+            release_id = rel.get("id")
             results.append({
-                "id": rel.get("id"),
+                "id": release_id,
                 "title": rel.get("title", "Unknown"),
                 "artist": self._flatten_artist(rel.get("artist-credit", [])),
-                "year": rel.get("date")  # full date string (or None)
+                "year": rel.get("date"),  # full date string (or None)
+                "coverart": self._get_cover_art_url(release_id) if release_id and include_coverart else None
             })
         return results[:limit]
 
@@ -245,7 +281,18 @@ class MusicBrainz(MetadataFetcher):
         if "releases" in recording and recording["releases"]:
             release = recording["releases"][0]
 
-        return self._build_track_metadata(recording, release)
+        track = self._build_track_metadata(recording, release)
+
+        # Add cover art URL as "picture"
+        if self.FETCH_COVERART and release and release.get("id"):
+            track["picture"] = self._get_cover_art_url(release["id"])
+        else:
+            track["picture"] = None
+        print(track["picture"])
+
+        return track
+
+
 
     def fetch_album_metadata(self, album_id: str) -> List[Dict[str, Any]]:
         """
@@ -257,6 +304,9 @@ class MusicBrainz(MetadataFetcher):
         params = {"inc": "recordings+artist-credits+release-groups+labels+genres"}
         data = self._get(f"release/{album_id}", params)
         release = data
+
+        # Get cover art URL once for the whole album
+        cover_url = self._get_cover_art_url(album_id) if self.FETCH_COVERART else None
 
         tracks = []
         for medium in release.get("media", []):
@@ -271,6 +321,7 @@ class MusicBrainz(MetadataFetcher):
                     track_info=track_info,
                     medium_info={"position": medium_pos}
                 )
+                track["picture"] = cover_url  # same for all tracks
                 tracks.append(track)
 
         return tracks
