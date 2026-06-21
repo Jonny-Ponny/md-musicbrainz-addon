@@ -102,6 +102,16 @@ class MusicBrainz(MetadataFetcher):
             return MusicBrainz._artist_string(artist_data)
         return "Unknown Artist"
 
+    @staticmethod
+    def _format_genres(genres_data: List[Dict]) -> str:
+        """Extract genre names, capitalize each word, and join with '; '."""
+        if not genres_data:
+            return ""
+        
+        names = [genre.get("name", "") for genre in genres_data if genre.get("name")]
+        formatted_genres = [name.title() for name in names]
+        return "; ".join(formatted_genres)
+
     def _build_track_metadata(
         self,
         recording: Dict,
@@ -169,6 +179,9 @@ class MusicBrainz(MetadataFetcher):
         if medium_info:
             track["disk"] = medium_info.get("position")
         
+        genres_data = recording.get("genres", [])
+        track["genre"] = self._format_genres(genres_data)
+
         # coveart - base64 encoded(optional)
         # track["picture"] = ""
 
@@ -224,7 +237,7 @@ class MusicBrainz(MetadataFetcher):
         Returns a flat dict with musicbrainz_trackid, musicbrainz_albumid (if available),
         musicbrainz_artistid, and all other fields.
         """
-        params = {"inc": "artist-credits+releases"}
+        params = {"inc": "artist-credits+releases+genres"}
         data = self._get(f"recording/{song_id}", params)
         recording = data
 
@@ -241,7 +254,7 @@ class MusicBrainz(MetadataFetcher):
           - musicbrainz_trackid, musicbrainz_albumid, musicbrainz_artistid,
             plus all other fields.
         """
-        params = {"inc": "recordings+artist-credits+release-groups+labels"}
+        params = {"inc": "recordings+artist-credits+release-groups+labels+genres"}
         data = self._get(f"release/{album_id}", params)
         release = data
 
