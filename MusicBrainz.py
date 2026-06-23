@@ -65,7 +65,7 @@ class MusicBrainz(MetadataFetcher):
         self._rate_limit()
         url = self.BASE_URL + endpoint
         params.setdefault("fmt", "json")
-        resp = self.session.get(url, params=params)
+        resp = self.session.get(url, params=params, timeout=20)
         resp.raise_for_status()
         return resp.json()
 
@@ -222,48 +222,54 @@ class MusicBrainz(MetadataFetcher):
         Search for recordings (songs). Results include:
           - musicbrainz_trackid, title, artist
         """
-        if include_coverart is None:
-            include_coverart = self.FETCH_COVERART
-        params = {"query": query, "limit": min(limit, 100), "inc": "releases"}
-        data = self._get("recording", params)
-        results = []
-        for rec in data.get("recordings", []):
-            release_id = None
-            if rec.get("releases"):
-                # Pick the first release
-                release_id = rec["releases"][0].get("id")
+        try:
+            if include_coverart is None:
+                include_coverart = self.FETCH_COVERART
+            params = {"query": query, "limit": min(limit, 100), "inc": "releases"}
+            data = self._get("recording", params)
+            results = []
+            for rec in data.get("recordings", []):
+                release_id = None
+                if rec.get("releases"):
+                    # Pick the first release
+                    release_id = rec["releases"][0].get("id")
 
-            entry = {
-                "id": rec.get("id"),
-                "title": rec.get("title", "Unknown"),
-                "artist": self._flatten_artist(rec.get("artist-credit", [])),
-                "coverart": None
-            }
-            if include_coverart and release_id:
-                entry["coverart"] = self._get_cover_art_url(release_id)
-            results.append(entry)
-        return results[:limit]
+                entry = {
+                    "id": rec.get("id"),
+                    "title": rec.get("title", "Unknown"),
+                    "artist": self._flatten_artist(rec.get("artist-credit", [])),
+                    "coverart": None
+                }
+                if include_coverart and release_id:
+                    entry["coverart"] = self._get_cover_art_url(release_id)
+                results.append(entry)
+            return results[:limit]
+        except Exception as e:
+            return []
 
     def search_albums(self, query: str, limit: int = 5, include_coverart: Optional[bool] = None) -> List[Dict[str, Any]]:
         """
         Search for releases (albums). Results include:
           - musicbrainz_albumid, title, artist, year (from release date)
         """
-        if include_coverart is None:
-            include_coverart = self.FETCH_COVERART
-        params = {"query": query, "limit": min(limit, 100)}
-        data = self._get("release", params)
-        results = []
-        for rel in data.get("releases", []):
-            release_id = rel.get("id")
-            results.append({
-                "id": release_id,
-                "title": rel.get("title", "Unknown"),
-                "artist": self._flatten_artist(rel.get("artist-credit", [])),
-                "year": rel.get("date"),  # full date string (or None)
-                "coverart": self._get_cover_art_url(release_id) if release_id and include_coverart else None
-            })
-        return results[:limit]
+        try:
+            if include_coverart is None:
+                include_coverart = self.FETCH_COVERART
+            params = {"query": query, "limit": min(limit, 100)}
+            data = self._get("release", params)
+            results = []
+            for rel in data.get("releases", []):
+                release_id = rel.get("id")
+                results.append({
+                    "id": release_id,
+                    "title": rel.get("title", "Unknown"),
+                    "artist": self._flatten_artist(rel.get("artist-credit", [])),
+                    "year": rel.get("date"),  # full date string (or None)
+                    "coverart": self._get_cover_art_url(release_id) if release_id and include_coverart else None
+                })
+            return results[:limit]
+        except Exception as e:
+            return []
 
     # ------------------ Fetch Metadata ------------------
 
@@ -288,7 +294,6 @@ class MusicBrainz(MetadataFetcher):
             track["picture"] = self._get_cover_art_url(release["id"])
         else:
             track["picture"] = None
-        print(track["picture"])
 
         return track
 
