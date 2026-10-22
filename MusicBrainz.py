@@ -1,10 +1,12 @@
 # MusicBrainz.py
-# Example addon implementataion using MusicBrainz API
+# Example addon implementation using the MusicBrainz API
 
 import os
-import requests
+import threading
 import time
 from typing import List, Dict, Any, Optional
+
+import requests
 from addon_base import MetadataFetcher
 
 # Supported fields:
@@ -13,39 +15,51 @@ from addon_base import MetadataFetcher
 # artist
 # comment
 # composer
+# date
 # description
-# disk
+# diskNumber
 # genre
 # lyrics
 # picture
 # publisher
 # releaseType
 # title
-# track
+# trackNumber
 # unsyncedLyrics
-# year
-
-# coverart for search
-# picture for fetches
-
+#
+# extraInfo is display-only and is never written as a tag.
+# coverart is used for search results, picture for fetched metadata.
 # Other fields returned as is
 
 class MusicBrainz(MetadataFetcher):
     name = "MusicBrainz"
     id = "musicbrainz"
     description = "Fetch song and album metadata from MusicBrainz database"
+    version = "1.1.0"
+    github = "https://github.com/Jonny-Ponny/md-musicbrainz-addon"
 
     # Base URL for addon
     BASE_URL = "https://musicbrainz.org/ws/2/"
+    COVER_ART_URL = "https://coverartarchive.org/release/{release_id}"
 
-    # Recommended to have meaningful user-agent
-    USER_AGENT = "metadata-docker-musicbrainz-addon/1.0.0"
+    # Recommended to have a meaningful user-agent with contact information
+    USER_AGENT = (
+        f"metadata-docker-musicbrainz-addon/{version} "
+        "(https://github.com/Jonny-Ponny/md-musicbrainz-addon)"
+    )
 
     required_env_vars = ["MD_MUSICBRAINZ_FETCH_COVER"]
 
     # Get setting from environment
     FETCH_COVERART = os.getenv("MD_MUSICBRAINZ_FETCH_COVER", "False").lower() in ('true', '1', 'yes', 'on')
 
+    REQUEST_TIMEOUT = 20
+    RATE_LIMIT_SECONDS = 1.0
+
+    # MusicBrainz allows one request per second. The app creates a new fetcher
+    # instance per API request, so the rate-limit state must live on the class
+    # and be protected by a lock to work across requests.
+    _rate_lock = threading.Lock()
     _last_request_time = 0.0
 
     def __init__(self):
@@ -55,34 +69,57 @@ class MusicBrainz(MetadataFetcher):
         })
 
     def _rate_limit(self):
-        now = time.time()
-        elapsed = now - self._last_request_time
-        if elapsed < 1.0:
-            time.sleep(1.0 - elapsed)
-        self._last_request_time = time.time()
+        cls = type(self)
+        with cls._rate_lock:
+            now = time.monotonic()
+            elapsed = now - cls._last_request_time
+            if elapsed < self.RATE_LIMIT_SECONDS:
+                time.sleep(self.RATE_LIMIT_SECONDS - elapsed)
+            cls._last_request_time = time.monotonic()
 
     def _get(self, endpoint: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        self._rate_limit()
         url = self.BASE_URL + endpoint
-        params.setdefault("fmt", "json")
-        resp = self.session.get(url, params=params, timeout=20)
-        resp.raise_for_status()
-        return resp.json()
+        request_params = dict(params)
+        request_params.setdefault("fmt", "json")
+
+        # MusicBrainz occasionally returns 429/503 when busy. Retry a couple of
+        # times with the server-provided delay before giving up.
+        for attempt in range(3):
+            self._rate_limit()
+            resp = self.session.get(
+                url,
+                params=request_params,
+                timeout=self.REQUEST_TIMEOUT,
+            )
+            if resp.status_code in (429, 503) and attempt < 2:
+                retry_after = resp.headers.get("Retry-After")
+                try:
+                    delay = max(self.RATE_LIMIT_SECONDS, float(retry_after))
+                except (TypeError, ValueError):
+                    delay = self.RATE_LIMIT_SECONDS * (attempt + 2)
+                time.sleep(delay)
+                continue
+
+            resp.raise_for_status()
+            return resp.json()
 
     @staticmethod
     def _artist_string(artist_credit: List[Dict]) -> str:
-        names = []
-        for credit in artist_credit:
-            if "artist" in credit:
-                names.append(credit["artist"]["name"])
-            elif "name" in credit:
-                names.append(credit["name"])
-        
-        if not names:
-            return "Various Artists"
-        if len(names) == 1:
-            return names[0]
-        return "; ".join(names)
+        """Join an artist credit using MusicBrainz's join phrases."""
+        if not artist_credit:
+            return "Unknown Artist"
+
+        parts = []
+        for index, credit in enumerate(artist_credit):
+            artist = credit.get("artist") or {}
+            name = artist.get("name") or credit.get("name")
+            if not name:
+                continue
+            parts.append(name)
+            if index < len(artist_credit) - 1:
+                parts.append(credit.get("joinphrase") or "; ")
+
+        return "".join(parts).strip() or "Unknown Artist"
 
     @staticmethod
     def _first_artist_id(artist_credit: List[Dict]) -> Optional[str]:
@@ -93,10 +130,12 @@ class MusicBrainz(MetadataFetcher):
         return None
 
     @staticmethod
-    def _extract_year(date_str: Optional[str]) -> Optional[str]:
-        if date_str and len(date_str) >= 4:
-            return date_str[:4]
-        return None
+    def _format_duration(length_ms: Any) -> str:
+        """Format a MusicBrainz length in milliseconds as m:ss."""
+        if not isinstance(length_ms, (int, float)) or length_ms <= 0:
+            return ""
+        total_seconds = int(round(length_ms / 1000))
+        return f"{total_seconds // 60}:{total_seconds % 60:02d}"
 
     @staticmethod
     def _flatten_artist(artist_data: Any) -> str:
@@ -110,12 +149,18 @@ class MusicBrainz(MetadataFetcher):
 
     @staticmethod
     def _format_genres(genres_data: List[Dict]) -> str:
-        """Extract genre names, capitalize each word, and join with '; '."""
+        """Extract unique genre names, capitalize each word, and join with '; '."""
         if not genres_data:
             return ""
-        
-        names = [genre.get("name", "") for genre in genres_data if genre.get("name")]
-        formatted_genres = [name.title() for name in names]
+
+        seen = set()
+        formatted_genres = []
+        for genre in genres_data:
+            name = (genre.get("name") or "").strip()
+            if not name or name.lower() in seen:
+                continue
+            seen.add(name.lower())
+            formatted_genres.append(name.title())
         return "; ".join(formatted_genres)
 
     def _get_cover_art_url(self, release_id: str) -> Optional[str]:
@@ -124,9 +169,9 @@ class MusicBrainz(MetadataFetcher):
         Returns the URL as a string, or None if not found.
         """
         self._rate_limit()
-        url = f"https://coverartarchive.org/release/{release_id}"
+        url = self.COVER_ART_URL.format(release_id=release_id)
         try:
-            resp = self.session.get(url)
+            resp = self.session.get(url, timeout=self.REQUEST_TIMEOUT)
             if resp.status_code == 404:
                 return None
             resp.raise_for_status()
@@ -134,7 +179,8 @@ class MusicBrainz(MetadataFetcher):
             for img in data.get("images", []):
                 if img.get("front"):
                     return img.get("image")
-        except Exception:
+        except requests.RequestException:
+            # Cover art is optional, so a failure must not break metadata fetch.
             pass
         return None
 
@@ -150,8 +196,8 @@ class MusicBrainz(MetadataFetcher):
           - musicbrainz_trackid
           - musicbrainz_albumid (if release provided)
           - musicbrainz_artistid (first artist from recording)
-          - title, artist, album, albumArtist, year, length, video, comment,
-            publisher, releaseType, track, disk
+          - title, artist, album, albumArtist, date, length, comment,
+            publisher, releaseType, trackNumber, diskNumber
         """
         track = {}
 
@@ -161,7 +207,7 @@ class MusicBrainz(MetadataFetcher):
         track["artist"] = self._flatten_artist(recording.get("artist-credit", []))
         track["musicbrainz_artistid"] = self._first_artist_id(recording.get("artist-credit", []))
         track["length"] = recording.get("length")
-        track["video"] = recording.get("video", False)
+        track["video"] = bool(recording.get("video"))
 
         # Disambiguation as comment
         if recording.get("disambiguation"):
@@ -172,16 +218,12 @@ class MusicBrainz(MetadataFetcher):
             track["album"] = release.get("title", "Unknown Album")
             track["albumArtist"] = self._flatten_artist(release.get("artist-credit", []))
             track["musicbrainz_albumid"] = release.get("id")
+            track["musicbrainz_albumartistid"] = self._first_artist_id(
+                release.get("artist-credit", [])
+            )
 
-            # Date handling – keep full date, also store year_short
-            if "date" in release:
-                track["year"] = release["date"]        # full date string (e.g., "1988-11-01")
-                track["first-release-date"] = release["date"]
-                track["year_short"] = self._extract_year(release["date"])
-            else:
-                track["year"] = None
-                track["first-release-date"] = None
-                track["year_short"] = None
+            if release.get("date"):
+                track["date"] = release["date"]
 
             # Publisher
             if "label-info" in release and release["label-info"]:
@@ -189,86 +231,139 @@ class MusicBrainz(MetadataFetcher):
                 if label:
                     track["publisher"] = label.get("name")
 
-            # Release type
-            if "release-group" in release:
-                rg = release["release-group"]
-                if "primary-type" in rg:
-                    track["releaseType"] = rg["primary-type"]
+            # Release type, including secondary types (e.g. "Album + Live")
+            rg = release.get("release-group") or {}
+            primary_type = rg.get("primary-type")
+            if primary_type:
+                secondary_types = rg.get("secondary-types") or []
+                track["releaseType"] = " + ".join([primary_type, *secondary_types])
 
             # Release disambiguation (if not already set)
             if release.get("disambiguation") and "comment" not in track:
                 track["comment"] = release["disambiguation"]
 
+        # Fall back to the recording's first release date when no release was supplied
+        if "date" not in track and recording.get("first-release-date"):
+            track["date"] = recording["first-release-date"]
+
         # Track and disc numbers
         if track_info:
-            track["track"] = track_info.get("number")
+            track["trackNumber"] = track_info.get("number")
         if medium_info:
-            track["disk"] = medium_info.get("position")
-        
-        genres_data = recording.get("genres", [])
-        track["genre"] = self._format_genres(genres_data)
+            track["diskNumber"] = medium_info.get("position")
 
-        # Add any other primitive fields from recording (optional)
+        # Recording genres are not included in release lookups, so fall back to
+        # the release genres there.
+        genres_data = recording.get("genres") or (release.get("genres") if release else [])
+        track["genre"] = self._format_genres(genres_data or [])
+
+        duration = self._format_duration(recording.get("length"))
+        if duration:
+            track["extraInfo"] = duration
+
+        # Add any other primitive fields from recording, but skip internal
+        # search/bookkeeping fields that should not become custom tags.
+        skip_fields = {"id", "score", "artist-credit", "releases", "genres", "tags",
+                       "disambiguation", "first-release-date"}
         for key, value in recording.items():
-            if key not in track and not isinstance(value, (dict, list)):
-                track[key] = value
+            if key in track or key in skip_fields or isinstance(value, (dict, list)):
+                continue
+            track[key] = value
 
         return track
 
     # ------------------ Search Methods ------------------
 
+    @staticmethod
+    def _clamp_limit(limit: int) -> int:
+        try:
+            value = int(limit)
+        except (TypeError, ValueError):
+            return 5
+        return max(1, min(value, 100))
+
     def search_songs(self, query: str, limit: int = 5, include_coverart: Optional[bool] = None) -> List[Dict[str, Any]]:
         """
         Search for recordings (songs). Results include:
-          - musicbrainz_trackid, title, artist
+          - id, title, artist, album, date, coverart, extraInfo
         """
         try:
             if include_coverart is None:
                 include_coverart = self.FETCH_COVERART
-            params = {"query": query, "limit": min(limit, 100), "inc": "releases"}
+            params = {"query": query, "limit": self._clamp_limit(limit)}
             data = self._get("recording", params)
             results = []
             for rec in data.get("recordings", []):
-                release_id = None
-                if rec.get("releases"):
-                    # Pick the first release
-                    release_id = rec["releases"][0].get("id")
+                releases = rec.get("releases") or []
+                release = releases[0] if releases else None
 
                 entry = {
                     "id": rec.get("id"),
                     "title": rec.get("title", "Unknown"),
                     "artist": self._flatten_artist(rec.get("artist-credit", [])),
-                    "coverart": None
                 }
-                if include_coverart and release_id:
-                    entry["coverart"] = self._get_cover_art_url(release_id)
+
+                if release:
+                    if release.get("title"):
+                        entry["album"] = release["title"]
+                    if release.get("date"):
+                        entry["date"] = release["date"]
+                if "date" not in entry and rec.get("first-release-date"):
+                    entry["date"] = rec["first-release-date"]
+
+                extra = []
+                duration = self._format_duration(rec.get("length"))
+                if duration:
+                    extra.append(duration)
+                if release and release.get("title"):
+                    extra.append(release["title"])
+                if extra:
+                    entry["extraInfo"] = " · ".join(extra)
+
+                if include_coverart and release and release.get("id"):
+                    entry["coverart"] = self._get_cover_art_url(release["id"])
+
                 results.append(entry)
-            return results[:limit]
-        except Exception as e:
+            return results
+        except Exception:
             return []
 
     def search_albums(self, query: str, limit: int = 5, include_coverart: Optional[bool] = None) -> List[Dict[str, Any]]:
         """
         Search for releases (albums). Results include:
-          - musicbrainz_albumid, title, artist, year (from release date)
+          - id, title, artist, date, coverart, extraInfo
         """
         try:
             if include_coverart is None:
                 include_coverart = self.FETCH_COVERART
-            params = {"query": query, "limit": min(limit, 100)}
+            params = {"query": query, "limit": self._clamp_limit(limit)}
             data = self._get("release", params)
             results = []
             for rel in data.get("releases", []):
                 release_id = rel.get("id")
-                results.append({
+                entry = {
                     "id": release_id,
                     "title": rel.get("title", "Unknown"),
                     "artist": self._flatten_artist(rel.get("artist-credit", [])),
-                    "year": rel.get("date"),  # full date string (or None)
-                    "coverart": self._get_cover_art_url(release_id) if release_id and include_coverart else None
-                })
-            return results[:limit]
-        except Exception as e:
+                    "date": rel.get("date"),
+                }
+
+                release_group = rel.get("release-group") or {}
+                extra = []
+                if release_group.get("primary-type"):
+                    extra.append(release_group["primary-type"])
+                track_count = rel.get("track-count")
+                if track_count:
+                    extra.append(f"{track_count} track" + ("" if track_count == 1 else "s"))
+                if extra:
+                    entry["extraInfo"] = " · ".join(extra)
+
+                if include_coverart and release_id:
+                    entry["coverart"] = self._get_cover_art_url(release_id)
+
+                results.append(entry)
+            return results
+        except Exception:
             return []
 
     # ------------------ Fetch Metadata ------------------
@@ -296,8 +391,6 @@ class MusicBrainz(MetadataFetcher):
             track["picture"] = None
 
         return track
-
-
 
     def fetch_album_metadata(self, album_id: str) -> List[Dict[str, Any]]:
         """
