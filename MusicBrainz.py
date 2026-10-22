@@ -9,6 +9,10 @@ from typing import List, Dict, Any, Optional
 import requests
 from addon_base import MetadataFetcher
 
+
+def _env_flag(name: str, default: str = "False") -> bool:
+    return os.getenv(name, default).strip().lower() in ("true", "1", "yes", "on")
+
 # Supported fields:
 # album
 # albumArtist
@@ -48,10 +52,16 @@ class MusicBrainz(MetadataFetcher):
         "(https://github.com/Jonny-Ponny/md-musicbrainz-addon)"
     )
 
-    required_env_vars = ["MD_MUSICBRAINZ_FETCH_COVER"]
+    required_env_vars = [
+        "MD_MUSICBRAINZ_FETCH_COVER",
+        "MD_MUSICBRAINZ_USE_JOIN_PHRASES",
+    ]
 
-    # Get setting from environment
-    FETCH_COVERART = os.getenv("MD_MUSICBRAINZ_FETCH_COVER", "False").lower() in ('true', '1', 'yes', 'on')
+    # Get settings from environment
+    FETCH_COVERART = _env_flag("MD_MUSICBRAINZ_FETCH_COVER")
+    # Use MusicBrainz join phrases ("A & B") instead of semicolon-separated
+    # names ("A; B") for artist credits.
+    USE_JOIN_PHRASES = _env_flag("MD_MUSICBRAINZ_USE_JOIN_PHRASES", "True")
 
     REQUEST_TIMEOUT = 20
     RATE_LIMIT_SECONDS = 1.0
@@ -103,8 +113,8 @@ class MusicBrainz(MetadataFetcher):
             resp.raise_for_status()
             return resp.json()
 
-    @staticmethod
-    def _artist_string(artist_credit: List[Dict]) -> str:
+    @classmethod
+    def _artist_string(cls, artist_credit: List[Dict]) -> str:
         """Join an artist credit using MusicBrainz's join phrases."""
         if not artist_credit:
             return "Unknown Artist"
@@ -117,7 +127,10 @@ class MusicBrainz(MetadataFetcher):
                 continue
             parts.append(name)
             if index < len(artist_credit) - 1:
-                parts.append(credit.get("joinphrase") or "; ")
+                if cls.USE_JOIN_PHRASES:
+                    parts.append(credit.get("joinphrase") or "; ")
+                else:
+                    parts.append("; ")
 
         return "".join(parts).strip() or "Unknown Artist"
 
@@ -137,14 +150,14 @@ class MusicBrainz(MetadataFetcher):
         total_seconds = int(round(length_ms / 1000))
         return f"{total_seconds // 60}:{total_seconds % 60:02d}"
 
-    @staticmethod
-    def _flatten_artist(artist_data: Any) -> str:
+    @classmethod
+    def _flatten_artist(cls, artist_data: Any) -> str:
         if isinstance(artist_data, str):
             return artist_data
         if isinstance(artist_data, dict) and "name" in artist_data:
             return artist_data["name"]
         if isinstance(artist_data, list):
-            return MusicBrainz._artist_string(artist_data)
+            return cls._artist_string(artist_data)
         return "Unknown Artist"
 
     @staticmethod

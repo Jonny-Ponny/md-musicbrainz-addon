@@ -80,6 +80,8 @@ Rate Limiting: Plugin uses a class‑level ```_last_request_time``` and a ```_ra
 
 User‑Agent: Recommended to set a unique ```User‑Agent``` header to identify your application to the service (MusicBrainz requires this). This addon includes its version and GitHub URL in the header.
 
+Artist credits: By default, multi-artist credits use MusicBrainz join phrases (for example ```A & B```). Set ```MD_MUSICBRAINZ_USE_JOIN_PHRASES=False``` to join names with ```; ``` instead (for example ```A; B```).
+
 Environment Variables: MusicBrainz is open and does not require an API key. If your plugin needs keys, list them in ```required_env_vars``` and read them via ```os.getenv()``` from docker-compose.yml.
 
 This addon uses ```MD_MUSICBRAINZ_FETCH_COVER``` environment variable to allow fetching of cover art in searches and metadata fetches. Since MusicBrainz and Cover Art Archive implement rate limiting, all requests are limited to 1 per second. Using searches with cover art fetching enabled will increase response time (~1 second per search result). If you need to fetch cover art use ```True```, if you want faster response time use ```False``` to disable cover art fetching.
