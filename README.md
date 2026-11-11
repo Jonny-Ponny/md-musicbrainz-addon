@@ -11,7 +11,7 @@ The class must set the following attributes:
 1. ```name = "MusicBrainz"```   - Human‑readable name (shown in UI)
 2. ```id = "musicbrainz"```     - Unique identifier (used in API routes)
 3. ```description = "..."```    - Optional short description
-4. ```version = "1.1.0"```      - Optional version string (shown in Settings)
+4. ```version = "1.1.1"```      - Optional version string (shown in Settings)
 5. ```github = "..."```         - Optional GitHub URL (shown as a link in Settings)
 6. ```required_env_vars = []``` - List of env var names needed (optional)
 
@@ -36,16 +36,17 @@ Method|Purpose|Return Type
 - Includes releases in the response to get album context.
 - Returns a flat dictionary with all fields (see Metadata Fields below).
 - The helper _build_track_metadata() consolidates the response.
+- Recording lookups omit release label info, so the release is fetched separately to expose its catalog number.
 
 ```search_albums```
 - Queries the MusicBrainz release endpoint.
 - Returns a list of short result objects (id, title, artist, date, coverart).
-- Includes a display-only ```extraInfo``` value with the release type and track count.
+- Includes a display-only ```extraInfo``` value with the release type, track count and catalog number when available.
 
 ```fetch_album_metadata```
 - Fetches a full release, including all tracks.
 - Iterates over media and tracks to build a list of track metadata dicts.
-- Each track inherits album‑level fields (album title, artist, date, etc.) automatically.
+- Each track inherits album‑level fields (album title, artist, date, catalog number, etc.) automatically.
 
 ### Metadata fields
 Plugin should return a flat dictionary (or list of dictionaries) that includes the fields expected by the app.
@@ -73,6 +74,8 @@ Supported fields:
 All other fields will be used as is, using field name received from addon
 
 MusicBrainz IDs are returned as custom fields: ```musicbrainz_trackid```, ```musicbrainz_albumid```, ```musicbrainz_artistid```, and ```musicbrainz_albumartistid```.
+
+Catalog numbers are returned as the ```CatalogNumber``` custom field when the release has one (from its ```label-info``` entries). Multiple unique catalog numbers are joined with ```; ```. The app writes this as ```TXXX:CatalogNumber``` for ID3, ```CatalogNumber``` for Vorbis comments/FLAC, and ```----:com.apple.iTunes:CatalogNumber``` for MP4.
 
 ### Helper Methods & Best Practices
 

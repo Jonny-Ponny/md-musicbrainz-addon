@@ -33,13 +33,14 @@ def _env_flag(name: str, default: str = "False") -> bool:
 #
 # extraInfo is display-only and is never written as a tag.
 # coverart is used for search results, picture for fetched metadata.
+# CatalogNumber is returned from release label-info when available.
 # Other fields returned as is
 
 class MusicBrainz(MetadataFetcher):
     name = "MusicBrainz"
     id = "musicbrainz"
     description = "Fetch song and album metadata from MusicBrainz database"
-    version = "1.1.0"
+    version = "1.1.1"
     github = "https://github.com/Jonny-Ponny/md-musicbrainz-addon"
 
     # Base URL for addon
@@ -176,6 +177,36 @@ class MusicBrainz(MetadataFetcher):
             formatted_genres.append(name.title())
         return "; ".join(formatted_genres)
 
+    @staticmethod
+    def _get_catalog_numbers(release: Optional[Dict]) -> str:
+        """Return the unique catalog numbers from a release's label-info list."""
+        if not release:
+            return ""
+
+        numbers = []
+        seen = set()
+        for info in release.get("label-info") or []:
+            if not isinstance(info, dict):
+                continue
+            number = info.get("catalog-number")
+            if not isinstance(number, str):
+                continue
+            number = number.strip()
+            key = number.lower()
+            if number and key not in seen:
+                seen.add(key)
+                numbers.append(number)
+        return "; ".join(numbers)
+
+    def _get_release_label_info(self, release_id: str) -> List[Dict]:
+        """Fetch a release's label info, which recording lookups omit."""
+        try:
+            data = self._get(f"release/{release_id}", {"inc": "labels"})
+        except Exception:
+            return []
+        label_info = data.get("label-info")
+        return label_info if isinstance(label_info, list) else []
+
     def _get_cover_art_url(self, release_id: str) -> Optional[str]:
         """
         Query the Cover Art Archive for the front cover image URL.
@@ -220,7 +251,6 @@ class MusicBrainz(MetadataFetcher):
         track["artist"] = self._flatten_artist(recording.get("artist-credit", []))
         track["musicbrainz_artistid"] = self._first_artist_id(recording.get("artist-credit", []))
         track["length"] = recording.get("length")
-        track["video"] = bool(recording.get("video"))
 
         # Disambiguation as comment
         if recording.get("disambiguation"):
@@ -243,6 +273,10 @@ class MusicBrainz(MetadataFetcher):
                 label = release["label-info"][0].get("label")
                 if label:
                     track["publisher"] = label.get("name")
+
+            catalog_number = self._get_catalog_numbers(release)
+            if catalog_number:
+                track["CatalogNumber"] = catalog_number
 
             # Release type, including secondary types (e.g. "Album + Live")
             rg = release.get("release-group") or {}
@@ -277,7 +311,7 @@ class MusicBrainz(MetadataFetcher):
         # Add any other primitive fields from recording, but skip internal
         # search/bookkeeping fields that should not become custom tags.
         skip_fields = {"id", "score", "artist-credit", "releases", "genres", "tags",
-                       "disambiguation", "first-release-date"}
+                       "disambiguation", "first-release-date", "video"}
         for key, value in recording.items():
             if key in track or key in skip_fields or isinstance(value, (dict, list)):
                 continue
@@ -330,6 +364,9 @@ class MusicBrainz(MetadataFetcher):
                     extra.append(duration)
                 if release and release.get("title"):
                     extra.append(release["title"])
+                catalog_number = self._get_catalog_numbers(release)
+                if catalog_number:
+                    extra.append(catalog_number)
                 if extra:
                     entry["extraInfo"] = " · ".join(extra)
 
@@ -368,6 +405,9 @@ class MusicBrainz(MetadataFetcher):
                 track_count = rel.get("track-count")
                 if track_count:
                     extra.append(f"{track_count} track" + ("" if track_count == 1 else "s"))
+                catalog_number = self._get_catalog_numbers(rel)
+                if catalog_number:
+                    extra.append(catalog_number)
                 if extra:
                     entry["extraInfo"] = " · ".join(extra)
 
@@ -394,6 +434,12 @@ class MusicBrainz(MetadataFetcher):
         release = None
         if "releases" in recording and recording["releases"]:
             release = recording["releases"][0]
+
+        # Recording lookups omit release label info, so fetch it separately to
+        # expose the release's catalog number as a writable field.
+        if release and release.get("id") and not release.get("label-info"):
+            release = dict(release)
+            release["label-info"] = self._get_release_label_info(release["id"])
 
         track = self._build_track_metadata(recording, release)
 
